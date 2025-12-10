@@ -27,6 +27,7 @@ import argparse
 import logging
 import os
 import csv
+from tqdm import tqdm
 
 from models import DiT_models
 from diffusion import create_diffusion
@@ -204,7 +205,8 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        progress = tqdm(loader, disable=rank != 0, desc=f"Epoch {epoch}", dynamic_ncols=True)
+        for x, y in progress:
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
@@ -255,6 +257,8 @@ def main(args):
                         "steps_per_sec": steps_per_sec
                     })
                     csv_file.flush()
+                if rank == 0:
+                    progress.set_postfix(loss=f"{avg_loss:.4f}", eps=f"{avg_eps:.4f}", x0=f"{avg_x0:.4f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 running_eps_loss = 0
