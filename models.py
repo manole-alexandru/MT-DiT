@@ -219,12 +219,12 @@ class DiT(nn.Module):
             nn.init.constant_(head.linear.weight, 0)
             nn.init.constant_(head.linear.bias, 0)
 
-    def unpatchify(self, x):
+    def unpatchify(self, x, channels=None):
         """
         x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        imgs: (N, C, H, W)
         """
-        c = self.out_channels
+        c = self.out_channels if channels is None else channels
         p = self.x_embedder.patch_size[0]
         h = w = int(x.shape[1] ** 0.5)
         assert h * w == x.shape[1]
@@ -250,7 +250,7 @@ class DiT(nn.Module):
         eps_out = self.final_eps(x, c)           # (N, T, patch_size ** 2 * out_channels)
         x0_out = self.final_x0(x, c)             # (N, T, patch_size ** 2 * in_channels)
         eps_out = self.unpatchify(eps_out)       # (N, out_channels, H, W)
-        x0_out = self.unpatchify(x0_out)         # (N, in_channels, H, W)
+        x0_out = self.unpatchify(x0_out, channels=self.in_channels)  # (N, in_channels, H, W)
         return {"eps": eps_out, "x0": x0_out}
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
