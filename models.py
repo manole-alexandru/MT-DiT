@@ -176,7 +176,10 @@ class DiT(nn.Module):
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        # Head 1: predicts noise (and variance if enabled).
+        self.final_eps = FinalLayer(hidden_size, patch_size, self.out_channels)
+        # Head 2: predicts x0 directly in VAE latent space.
+        self.final_x0 = FinalLayer(hidden_size, patch_size, self.in_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -210,10 +213,11 @@ class DiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        for head in [self.final_eps, self.final_x0]:
+            nn.init.constant_(head.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(head.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(head.linear.weight, 0)
+            nn.init.constant_(head.linear.bias, 0)
 
     def unpatchify(self, x):
         """
@@ -243,9 +247,11 @@ class DiT(nn.Module):
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
-        return x
+        eps_out = self.final_eps(x, c)           # (N, T, patch_size ** 2 * out_channels)
+        x0_out = self.final_x0(x, c)             # (N, T, patch_size ** 2 * in_channels)
+        eps_out = self.unpatchify(eps_out)       # (N, out_channels, H, W)
+        x0_out = self.unpatchify(x0_out)         # (N, in_channels, H, W)
+        return {"eps": eps_out, "x0": x0_out}
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
@@ -254,16 +260,17 @@ class DiT(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
+        out = self.forward(combined, t, y)
+        eps_full = out["eps"]
+        eps, rest = eps_full[:, : self.in_channels], eps_full[:, self.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        guided_eps = torch.cat([uncond_eps + cfg_scale * (cond_eps - uncond_eps)] * 2, dim=0)
+        guided_eps_full = torch.cat([guided_eps, rest], dim=1)
+
+        x0 = out["x0"]
+        cond_x0, uncond_x0 = torch.split(x0, len(x0) // 2, dim=0)
+        guided_x0 = torch.cat([uncond_x0 + cfg_scale * (cond_x0 - uncond_x0)] * 2, dim=0)
+        return {"eps": guided_eps_full, "x0": guided_x0}
 
 
 #################################################################################

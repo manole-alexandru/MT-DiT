@@ -48,24 +48,27 @@ def main(args):
 
     # Create sampling noise:
     n = len(class_labels)
-    z = torch.randn(n, 4, latent_size, latent_size, device=device)
+    base_z = torch.randn(n, 4, latent_size, latent_size, device=device)
     y = torch.tensor(class_labels, device=device)
 
     # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
+    z = torch.cat([base_z, base_z], 0)
     y_null = torch.tensor([1000] * n, device=device)
     y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-
-    # Sample images:
-    samples = diffusion.p_sample_loop(
-        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
-    )
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
-
-    # Save and display images:
-    save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+    head_alias = {"head1": "eps", "head2": "x0", "blend": "blend"}
+    modes = [m.strip() for m in args.gen_modes.split(",") if m.strip()]
+    for mode in modes:
+        head = head_alias.get(mode)
+        assert head is not None, f"Unknown generation mode: {mode}"
+        model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, head=head, blend_weight=args.blend_weight)
+        samples = diffusion.p_sample_loop(
+            model.forward_with_cfg, z.shape, z.clone(), clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+        )
+        samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        samples = vae.decode(samples / 0.18215).sample
+        out_path = f"sample_{mode}.png"
+        save_image(samples, out_path, nrow=4, normalize=True, value_range=(-1, 1))
+        print(f"Saved samples for {mode} to {out_path}")
 
 
 if __name__ == "__main__":
@@ -79,5 +82,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--gen-modes", type=str, default="head1,head2,blend",
+                        help="Comma-separated list of generation modes: head1 (eps), head2 (x0), blend.")
+    parser.add_argument("--blend-weight", type=float, default=0.5,
+                        help="Blend weight for combining eps and x0 heads when mode=blend.")
     args = parser.parse_args()
     main(args)

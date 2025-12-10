@@ -102,45 +102,57 @@ def main(args):
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
-    pbar = range(iterations)
-    pbar = tqdm(pbar) if rank == 0 else pbar
-    total = 0
-    for _ in pbar:
-        # Sample inputs:
-        z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
+    head_alias = {"head1": "eps", "head2": "x0", "blend": "blend"}
+    modes = [m.strip() for m in args.gen_modes.split(",") if m.strip()]
+    for mode in modes:
+        head = head_alias.get(mode)
+        assert head is not None, f"Unknown generation mode: {mode}"
+        mode_folder = f"{sample_folder_dir}/{mode}"
+        if rank == 0:
+            os.makedirs(mode_folder, exist_ok=True)
+            print(f"Sampling mode={mode} into {mode_folder}")
+        dist.barrier()
+        pbar = range(iterations)
+        pbar = tqdm(pbar) if rank == 0 else pbar
+        total = 0
+        for _ in pbar:
+            # Sample inputs:
+            z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
+            y = torch.randint(0, args.num_classes, (n,), device=device)
 
-        # Setup classifier-free guidance:
-        if using_cfg:
-            z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
-            y = torch.cat([y, y_null], 0)
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-            sample_fn = model.forward_with_cfg
-        else:
-            model_kwargs = dict(y=y)
-            sample_fn = model.forward
+            # Setup classifier-free guidance:
+            if using_cfg:
+                z = torch.cat([z, z], 0)
+                y_null = torch.tensor([1000] * n, device=device)
+                y = torch.cat([y, y_null], 0)
+                model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, head=head, blend_weight=args.blend_weight)
+                sample_fn = model.forward_with_cfg
+            else:
+                model_kwargs = dict(y=y, head=head, blend_weight=args.blend_weight)
+                sample_fn = model.forward
 
-        # Sample images:
-        samples = diffusion.p_sample_loop(
-            sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
-        )
-        if using_cfg:
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+            # Sample images:
+            samples = diffusion.p_sample_loop(
+                sample_fn, z.shape, z.clone(), clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
+            )
+            if using_cfg:
+                samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
-        samples = vae.decode(samples / 0.18215).sample
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+            samples = vae.decode(samples / 0.18215).sample
+            samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
-        # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
-        total += global_batch_size
+            # Save samples to disk as individual .png files
+            for i, sample in enumerate(samples):
+                index = i * dist.get_world_size() + rank + total
+                Image.fromarray(sample).save(f"{mode_folder}/{index:06d}.png")
+            total += global_batch_size
 
-    # Make sure all processes have finished saving their samples before attempting to convert to .npz
-    dist.barrier()
+        # Make sure all processes have finished saving their samples before attempting to convert to .npz
+        dist.barrier()
+        if rank == 0:
+            create_npz_from_sample_folder(mode_folder, args.num_fid_samples)
+        dist.barrier()
     if rank == 0:
-        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
     dist.barrier()
     dist.destroy_process_group()
@@ -162,5 +174,9 @@ if __name__ == "__main__":
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--gen-modes", type=str, default="head1,head2,blend",
+                        help="Comma-separated list of generation modes: head1 (eps), head2 (x0), blend.")
+    parser.add_argument("--blend-weight", type=float, default=0.5,
+                        help="Blend weight for combining eps and x0 heads when mode=blend.")
     args = parser.parse_args()
     main(args)

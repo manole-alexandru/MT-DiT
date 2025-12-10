@@ -20,6 +20,23 @@ def mean_flat(tensor):
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
+def _clean_model_kwargs(model_kwargs):
+    if model_kwargs is None:
+        return {}
+    return {k: v for k, v in model_kwargs.items() if k not in ["head", "blend_weight"]}
+
+
+def _parse_model_output(model_output):
+    """
+    Normalize different model output formats.
+    Returns (output, extra) where output is either a tensor or a dict with keys eps/x0.
+    """
+    extra = None
+    if isinstance(model_output, tuple):
+        model_output, extra = model_output
+    return model_output, extra
+
+
 class ModelMeanType(enum.Enum):
     """
     Which type of output the model predicts.
@@ -273,18 +290,25 @@ class GaussianDiffusion:
         """
         if model_kwargs is None:
             model_kwargs = {}
+        head_mode = model_kwargs.get("head", "eps")
+        blend_weight = model_kwargs.get("blend_weight", 0.5)
+        model_kwargs_clean = _clean_model_kwargs(model_kwargs)
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, t, **model_kwargs)
-        if isinstance(model_output, tuple):
-            model_output, extra = model_output
+        model_output_raw, extra = _parse_model_output(model(x, t, **model_kwargs_clean))
+        if isinstance(model_output_raw, dict):
+            eps_full = model_output_raw.get("eps", None)
+            x0_direct = model_output_raw.get("x0", None)
         else:
-            extra = None
+            eps_full = model_output_raw
+            x0_direct = None
+        assert eps_full is not None, "Model must return eps head output."
+        eps_pred = eps_full[:, :C]
+        model_var_values = eps_full[:, C:] if eps_full.shape[1] > C else None
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
-            assert model_output.shape == (B, C * 2, *x.shape[2:])
-            model_output, model_var_values = th.split(model_output, C, dim=1)
+            assert model_var_values is not None, "Expected variance prediction from eps head."
             min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
             max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
             # The model_var_values is [-1, 1] for [min_var, max_var].
@@ -314,12 +338,25 @@ class GaussianDiffusion:
                 return x.clamp(-1, 1)
             return x
 
-        if self.model_mean_type == ModelMeanType.START_X:
-            pred_xstart = process_xstart(model_output)
+        if self.model_mean_type == ModelMeanType.START_X and x0_direct is not None:
+            pred_xstart = process_xstart(x0_direct)
+            eps_for_mean = self._predict_eps_from_xstart(x, t, pred_xstart)
         else:
-            pred_xstart = process_xstart(
-                self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
-            )
+            eps_for_mean = eps_pred
+            if head_mode == "x0" and x0_direct is not None:
+                pred_xstart = process_xstart(x0_direct)
+                eps_for_mean = self._predict_eps_from_xstart(x, t, pred_xstart)
+            elif head_mode == "blend" and x0_direct is not None:
+                x0_processed = process_xstart(x0_direct)
+                eps_from_x0 = self._predict_eps_from_xstart(x, t, x0_processed)
+                eps_for_mean = (1 - blend_weight) * eps_pred + blend_weight * eps_from_x0
+                pred_xstart = process_xstart(
+                    self._predict_xstart_from_eps(x_t=x, t=t, eps=eps_for_mean)
+                )
+            else:
+                pred_xstart = process_xstart(
+                    self._predict_xstart_from_eps(x_t=x, t=t, eps=eps_pred)
+                )
         model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
 
         assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
@@ -744,18 +781,27 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, t, **model_kwargs)
+            model_kwargs_clean = _clean_model_kwargs(model_kwargs)
+            model_output_raw, _ = _parse_model_output(model(x_t, t, **model_kwargs_clean))
+            if isinstance(model_output_raw, dict):
+                eps_full = model_output_raw.get("eps", None)
+                x0_pred = model_output_raw.get("x0", None)
+            else:
+                eps_full = model_output_raw
+                x0_pred = None
+            B, C = x_t.shape[:2]
+            assert eps_full is not None, "Model must return eps head output."
+            eps_pred = eps_full[:, :C]
+            model_var_values = eps_full[:, C:] if eps_full.shape[1] > C else None
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                B, C = x_t.shape[:2]
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-                model_output, model_var_values = th.split(model_output, C, dim=1)
+                assert model_var_values is not None, "Expected variance prediction from eps head."
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+                frozen_out = th.cat([eps_pred.detach(), model_var_values], dim=1)
                 terms["vb"] = self._vb_terms_bpd(
                     model=lambda *args, r=frozen_out: r,
                     x_start=x_start,
@@ -768,19 +814,23 @@ class GaussianDiffusion:
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
 
-            target = {
+            target_eps = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
                 )[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
-            assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
-            if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
+            assert eps_pred.shape == target_eps.shape == x_start.shape
+            terms["mse_eps"] = mean_flat((target_eps - eps_pred) ** 2)
+            if x0_pred is not None:
+                terms["mse_x0"] = mean_flat((x0_pred - x_start) ** 2)
             else:
-                terms["loss"] = terms["mse"]
+                terms["mse_x0"] = th.zeros_like(terms["mse_eps"])
+            if "vb" in terms:
+                terms["loss"] = terms["mse_eps"] + terms["vb"]
+            else:
+                terms["loss"] = terms["mse_eps"]
         else:
             raise NotImplementedError(self.loss_type)
 

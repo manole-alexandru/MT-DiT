@@ -26,6 +26,7 @@ from time import time
 import argparse
 import logging
 import os
+import csv
 
 from models import DiT_models
 from diffusion import create_diffusion
@@ -133,8 +134,13 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        csv_path = f"{experiment_dir}/log.csv"
+        csv_file = open(csv_path, mode="w", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=["step", "loss_total", "loss_eps", "loss_x0", "loss_vb", "steps_per_sec"])
+        csv_writer.writeheader()
     else:
         logger = create_logger(None)
+        csv_file, csv_writer = None, None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -189,6 +195,9 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    running_eps_loss = 0
+    running_x0_loss = 0
+    running_vb_loss = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
@@ -204,7 +213,10 @@ def main(args):
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            eps_loss = loss_dict["mse_eps"].mean()
+            x0_loss = loss_dict["mse_x0"].mean()
+            vb_loss = loss_dict.get("vb", torch.tensor(0.0, device=device)).mean()
+            loss = args.loss_weight_eps * eps_loss + args.loss_weight_x0 * x0_loss + vb_loss
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -212,6 +224,9 @@ def main(args):
 
             # Log loss values:
             running_loss += loss.item()
+            running_eps_loss += eps_loss.item()
+            running_x0_loss += x0_loss.item()
+            running_vb_loss += vb_loss.item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -220,12 +235,31 @@ def main(args):
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_tensor = torch.tensor([
+                    running_loss / log_steps,
+                    running_eps_loss / log_steps,
+                    running_x0_loss / log_steps,
+                    running_vb_loss / log_steps
+                ], device=device)
+                dist.all_reduce(avg_tensor, op=dist.ReduceOp.SUM)
+                avg_tensor /= dist.get_world_size()
+                avg_loss, avg_eps, avg_x0, avg_vb = avg_tensor.tolist()
+                logger.info(f"(step={train_steps:07d}) Loss: {avg_loss:.4f} (eps={avg_eps:.4f}, x0={avg_x0:.4f}, vb={avg_vb:.4f}), Steps/Sec: {steps_per_sec:.2f}")
+                if rank == 0 and csv_writer is not None:
+                    csv_writer.writerow({
+                        "step": train_steps,
+                        "loss_total": avg_loss,
+                        "loss_eps": avg_eps,
+                        "loss_x0": avg_x0,
+                        "loss_vb": avg_vb,
+                        "steps_per_sec": steps_per_sec
+                    })
+                    csv_file.flush()
                 # Reset monitoring variables:
                 running_loss = 0
+                running_eps_loss = 0
+                running_x0_loss = 0
+                running_vb_loss = 0
                 log_steps = 0
                 start_time = time()
 
@@ -247,6 +281,8 @@ def main(args):
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
+    if rank == 0 and csv_file is not None:
+        csv_file.close()
     cleanup()
 
 
@@ -265,5 +301,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--loss-weight-eps", type=float, default=1.0)
+    parser.add_argument("--loss-weight-x0", type=float, default=1.0)
     args = parser.parse_args()
     main(args)
