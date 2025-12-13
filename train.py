@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+from torchvision.utils import save_image
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
@@ -105,6 +106,132 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+@torch.no_grad()
+def decode_latents(latents, vae):
+    """
+    Decode VAE latents back to images in [-1, 1].
+    """
+    return vae.decode(latents / 0.18215).sample
+
+
+@torch.inference_mode()
+def run_validation(
+    *,
+    ema,
+    diffusion,
+    vae,
+    val_loader,
+    num_val_samples,
+    latent_size,
+    device,
+    num_classes,
+    logger,
+    sample_dir,
+    cfg_scale=1.5,
+    head="blend",
+    blend_weight=0.5,
+    num_grid_samples=16,
+):
+    """
+    Run validation: collect real images, generate samples, compute FID/IS/KID, and save a sample grid.
+    """
+    if val_loader is None:
+        logger.warning("Validation loader unavailable; skipping validation metrics.")
+        return {}
+
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchmetrics.image.inception import InceptionScore
+        from torchmetrics.image.kid import KernelInceptionDistance
+    except ImportError as err:
+        logger.error(f"torchmetrics not available ({err}); skipping validation metrics.")
+        return {}
+
+    fid = FrechetInceptionDistance(normalize=True).to(device)
+    inception = InceptionScore(normalize=True, splits=1).to(device)
+    kid = KernelInceptionDistance(subset_size=1000, normalize=True).to(device)
+
+    real_seen = 0
+    for real_images, _ in tqdm(val_loader, desc="Collecting real images", leave=False):
+        real_images = real_images.to(device)
+        fid.update(real_images, real=True)
+        kid.update(real_images, real=True)
+        real_seen += real_images.size(0)
+        if real_seen >= num_val_samples:
+            break
+
+    ema.eval()
+    head_alias = {"head1": "eps", "head2": "x0", "blend": "blend"}
+    gen_head = head_alias.get(head, "blend")
+    generated = 0
+    grid_samples = []
+    grid_count = 0
+    batch_size = val_loader.batch_size or 1
+    while generated < num_val_samples:
+        current_bs = min(batch_size, num_val_samples - generated)
+        z = torch.randn(current_bs, ema.in_channels, latent_size, latent_size, device=device)
+        y = torch.randint(0, num_classes, (current_bs,), device=device)
+        if cfg_scale > 1.0:
+            z = torch.cat([z, z], 0)
+            y_null = torch.tensor([num_classes] * current_bs, device=device)
+            y = torch.cat([y, y_null], 0)
+            model_kwargs = dict(y=y, cfg_scale=cfg_scale, head=gen_head, blend_weight=blend_weight)
+            sample_fn = ema.forward_with_cfg
+        else:
+            model_kwargs = dict(y=y, head=gen_head, blend_weight=blend_weight)
+            sample_fn = ema.forward
+
+        samples = diffusion.p_sample_loop(
+            sample_fn,
+            z.shape,
+            z.clone(),
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            progress=False,
+            device=device,
+        )
+        if cfg_scale > 1.0:
+            samples, _ = samples.chunk(2, dim=0)
+        samples = decode_latents(samples, vae)
+        samples = torch.clamp((samples + 1) / 2, 0, 1)
+        if samples.shape[0] > current_bs:
+            samples = samples[:current_bs]
+
+        fid.update(samples, real=False)
+        kid.update(samples, real=False)
+        inception.update(samples)
+        generated += samples.shape[0]
+
+        if grid_count < num_grid_samples:
+            needed = num_grid_samples - grid_count
+            take = samples[:needed].cpu()
+            grid_samples.append(take)
+            grid_count += take.shape[0]
+
+    if grid_samples:
+        grid = torch.cat(grid_samples, dim=0)[:num_grid_samples]
+        grid_path = os.path.join(sample_dir, "val_samples.png")
+        save_image(grid, grid_path, nrow=int(num_grid_samples ** 0.5), normalize=True, value_range=(0, 1))
+        logger.info(f"Saved validation sample grid to {grid_path}")
+
+    fid_score = fid.compute().item()
+    is_mean, is_std = inception.compute()
+    kid_mean, kid_std = kid.compute()
+    metrics = {
+        "fid": fid_score,
+        "inception_score": is_mean.item(),
+        "inception_score_std": is_std.item(),
+        "kid_mean": kid_mean.item(),
+        "kid_std": kid_std.item(),
+    }
+    logger.info(
+        f"Validation metrics -> FID: {metrics['fid']:.4f}, "
+        f"IS: {metrics['inception_score']:.4f} +/- {metrics['inception_score_std']:.4f}, "
+        f"KID: {metrics['kid_mean']:.6f} +/- {metrics['kid_std']:.6f}"
+    )
+    return metrics
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -137,7 +264,22 @@ def main(args):
         logger.info(f"Experiment directory created at {experiment_dir}")
         csv_path = f"{experiment_dir}/log.csv"
         csv_file = open(csv_path, mode="w", newline="")
-        csv_writer = csv.DictWriter(csv_file, fieldnames=["step", "loss_total", "loss_eps", "loss_x0", "loss_vb", "steps_per_sec"])
+        csv_writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "step",
+                "loss_total",
+                "loss_eps",
+                "loss_x0",
+                "loss_vb",
+                "steps_per_sec",
+                "fid",
+                "kid_mean",
+                "kid_std",
+                "inception_score",
+                "inception_score_std",
+            ],
+        )
         csv_writer.writeheader()
     else:
         logger = create_logger(None)
@@ -155,6 +297,7 @@ def main(args):
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    eval_diffusion = create_diffusion(str(args.eval_num_steps)) if args.eval_num_steps else diffusion
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -169,6 +312,23 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     dataset = ImageFolder(args.data_path, transform=transform)
+    val_loader = None
+    if rank == 0:
+        val_path = args.val_path or args.data_path
+        val_transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.ToTensor(),
+        ])
+        val_dataset = ImageFolder(val_path, transform=val_transform)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        logger.info(f"Validation set contains {len(val_dataset):,} images ({val_path})")
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -254,7 +414,12 @@ def main(args):
                         "loss_eps": avg_eps,
                         "loss_x0": avg_x0,
                         "loss_vb": avg_vb,
-                        "steps_per_sec": steps_per_sec
+                        "steps_per_sec": steps_per_sec,
+                        "fid": "",
+                        "kid_mean": "",
+                        "kid_std": "",
+                        "inception_score": "",
+                        "inception_score_std": "",
                     })
                     csv_file.flush()
                 if rank == 0:
@@ -283,6 +448,39 @@ def main(args):
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+    if rank == 0:
+        metrics = run_validation(
+            ema=ema,
+            diffusion=eval_diffusion,
+            vae=vae,
+            val_loader=val_loader,
+            num_val_samples=args.num_val_samples,
+            latent_size=latent_size,
+            device=device,
+            num_classes=args.num_classes,
+            logger=logger,
+            sample_dir=experiment_dir,
+            cfg_scale=args.eval_cfg_scale,
+            head=args.eval_head,
+            blend_weight=args.eval_blend_weight,
+            num_grid_samples=args.num_grid_samples,
+        )
+        if metrics and csv_writer is not None:
+            csv_writer.writerow({
+                "step": train_steps,
+                "loss_total": "",
+                "loss_eps": "",
+                "loss_x0": "",
+                "loss_vb": "",
+                "steps_per_sec": "",
+                "fid": metrics.get("fid", ""),
+                "kid_mean": metrics.get("kid_mean", ""),
+                "kid_std": metrics.get("kid_std", ""),
+                "inception_score": metrics.get("inception_score", ""),
+                "inception_score_std": metrics.get("inception_score_std", ""),
+            })
+            csv_file.flush()
+    dist.barrier()
 
     logger.info("Done!")
     if rank == 0 and csv_file is not None:
@@ -307,5 +505,17 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--loss-weight-eps", type=float, default=1.0)
     parser.add_argument("--loss-weight-x0", type=float, default=1.0)
+    parser.add_argument("--val-path", type=str, default=None, help="Optional validation dataset path (ImageFolder). Defaults to data-path.")
+    parser.add_argument("--val-batch-size", type=int, default=64)
+    parser.add_argument("--num-val-samples", type=int, default=2048)
+    parser.add_argument("--num-grid-samples", type=int, default=16)
+    parser.add_argument("--eval-cfg-scale", type=float, default=1.5)
+    parser.add_argument("--eval-head", type=str, default="blend", help="Generation head for evaluation: head1 (eps), head2 (x0), blend.")
+    parser.add_argument("--eval-blend-weight", type=float, default=0.5, help="Blend weight when eval-head=blend.")
+    parser.add_argument("--eval-num-steps", type=int, default=250, help="Number of sampling steps for validation generation.")
     args = parser.parse_args()
     main(args)
+
+
+
+
