@@ -294,7 +294,7 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+    model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     eval_diffusion = create_diffusion(str(args.eval_num_steps)) if args.eval_num_steps else diffusion
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
