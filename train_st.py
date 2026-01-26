@@ -127,6 +127,7 @@ def run_validation(
     num_classes,
     logger,
     sample_dir,
+    tag,
     cfg_scale=1.5,
     head="blend",
     blend_weight=0.5,
@@ -152,7 +153,7 @@ def run_validation(
     kid = KernelInceptionDistance(subset_size=1000, normalize=True).to(device)
 
     real_seen = 0
-    for real_images, _ in tqdm(val_loader, desc="Collecting real images", leave=False):
+    for real_images, _ in tqdm(val_loader, desc=f"Collecting real images ({tag})", leave=False):
         real_images = real_images.to(device)
         fid.update(real_images, real=True)
         kid.update(real_images, real=True)
@@ -210,7 +211,7 @@ def run_validation(
 
     if grid_samples:
         grid = torch.cat(grid_samples, dim=0)[:num_grid_samples]
-        grid_path = os.path.join(sample_dir, "val_samples.png")
+        grid_path = os.path.join(sample_dir, f"{tag}_samples.png")
         save_image(grid, grid_path, nrow=int(num_grid_samples ** 0.5), normalize=True, value_range=(0, 1))
         logger.info(f"Saved validation sample grid to {grid_path}")
 
@@ -225,7 +226,7 @@ def run_validation(
         "kid_std": kid_std.item(),
     }
     logger.info(
-        f"Validation metrics -> FID: {metrics['fid']:.4f}, "
+        f"Metrics ({tag}) -> FID: {metrics['fid']:.4f}, "
         f"IS: {metrics['inception_score']:.4f} +/- {metrics['inception_score_std']:.4f}, "
         f"KID: {metrics['kid_mean']:.6f} +/- {metrics['kid_std']:.6f}"
     )
@@ -257,9 +258,11 @@ def main(args):
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
+        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}_st"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        samples_dir = f"{experiment_dir}/samples"
         os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(samples_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
         csv_path = f"{experiment_dir}/log.csv"
@@ -268,6 +271,8 @@ def main(args):
             csv_file,
             fieldnames=[
                 "step",
+                "epoch",
+                "split",
                 "loss_total",
                 "loss_eps",
                 "loss_vb",
@@ -312,6 +317,7 @@ def main(args):
     ])
     dataset = ImageFolder(args.data_path, transform=transform)
     val_loader = None
+    train_metrics_loader = None
     if rank == 0:
         val_path = args.val_path or args.data_path
         val_transform = transforms.Compose([
@@ -328,6 +334,16 @@ def main(args):
             drop_last=False
         )
         logger.info(f"Validation set contains {len(val_dataset):,} images ({val_path})")
+        train_metrics_dataset = ImageFolder(args.data_path, transform=val_transform)
+        train_metrics_loader = DataLoader(
+            train_metrics_dataset,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        logger.info(f"Train metrics set contains {len(train_metrics_dataset):,} images ({args.data_path})")
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -406,6 +422,8 @@ def main(args):
                 if rank == 0 and csv_writer is not None:
                     csv_writer.writerow({
                         "step": train_steps,
+                        "epoch": epoch,
+                        "split": "train",
                         "loss_total": avg_loss,
                         "loss_eps": avg_eps,
                         "loss_vb": avg_vb,
@@ -440,40 +458,76 @@ def main(args):
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
-    model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-    if rank == 0:
-        metrics = run_validation(
-            ema=ema,
-            diffusion=eval_diffusion,
-            vae=vae,
-            val_loader=val_loader,
-            num_val_samples=args.num_val_samples,
-            latent_size=latent_size,
-            device=device,
-            num_classes=args.num_classes,
-            logger=logger,
-            sample_dir=experiment_dir,
-            cfg_scale=args.eval_cfg_scale,
-            head=args.eval_head,
-            blend_weight=args.eval_blend_weight,
-            num_grid_samples=args.num_grid_samples,
-        )
-        if metrics and csv_writer is not None:
-            csv_writer.writerow({
-                "step": train_steps,
-                "loss_total": "",
-                "loss_eps": "",
-                "loss_vb": "",
-                "steps_per_sec": "",
-                "fid": metrics.get("fid", ""),
-                "kid_mean": metrics.get("kid_mean", ""),
-                "kid_std": metrics.get("kid_std", ""),
-                "inception_score": metrics.get("inception_score", ""),
-                "inception_score_std": metrics.get("inception_score_std", ""),
-            })
-            csv_file.flush()
-    dist.barrier()
+        if rank == 0:
+            epoch_dir = os.path.join(samples_dir, f"epoch_{epoch:04d}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            val_metrics = run_validation(
+                ema=ema,
+                diffusion=eval_diffusion,
+                vae=vae,
+                val_loader=val_loader,
+                num_val_samples=args.num_val_samples,
+                latent_size=latent_size,
+                device=device,
+                num_classes=args.num_classes,
+                logger=logger,
+                sample_dir=epoch_dir,
+                tag="val",
+                cfg_scale=args.eval_cfg_scale,
+                head=args.eval_head,
+                blend_weight=args.eval_blend_weight,
+                num_grid_samples=args.num_grid_samples,
+            )
+            if val_metrics and csv_writer is not None:
+                csv_writer.writerow({
+                    "step": train_steps,
+                    "epoch": epoch,
+                    "split": "val",
+                    "loss_total": "",
+                    "loss_eps": "",
+                    "loss_vb": "",
+                    "steps_per_sec": "",
+                    "fid": val_metrics.get("fid", ""),
+                    "kid_mean": val_metrics.get("kid_mean", ""),
+                    "kid_std": val_metrics.get("kid_std", ""),
+                    "inception_score": val_metrics.get("inception_score", ""),
+                    "inception_score_std": val_metrics.get("inception_score_std", ""),
+                })
+                csv_file.flush()
+            train_metrics = run_validation(
+                ema=ema,
+                diffusion=eval_diffusion,
+                vae=vae,
+                val_loader=train_metrics_loader,
+                num_val_samples=args.num_val_samples,
+                latent_size=latent_size,
+                device=device,
+                num_classes=args.num_classes,
+                logger=logger,
+                sample_dir=epoch_dir,
+                tag="train",
+                cfg_scale=args.eval_cfg_scale,
+                head=args.eval_head,
+                blend_weight=args.eval_blend_weight,
+                num_grid_samples=args.num_grid_samples,
+            )
+            if train_metrics and csv_writer is not None:
+                csv_writer.writerow({
+                    "step": train_steps,
+                    "epoch": epoch,
+                    "split": "train",
+                    "loss_total": "",
+                    "loss_eps": "",
+                    "loss_vb": "",
+                    "steps_per_sec": "",
+                    "fid": train_metrics.get("fid", ""),
+                    "kid_mean": train_metrics.get("kid_mean", ""),
+                    "kid_std": train_metrics.get("kid_std", ""),
+                    "inception_score": train_metrics.get("inception_score", ""),
+                    "inception_score_std": train_metrics.get("inception_score_std", ""),
+                })
+                csv_file.flush()
+        dist.barrier()
 
     logger.info("Done!")
     if rank == 0 and csv_file is not None:
