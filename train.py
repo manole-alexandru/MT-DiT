@@ -467,74 +467,78 @@ def main(args):
         if rank == 0:
             epoch_dir = os.path.join(samples_dir, f"epoch_{epoch:04d}")
             os.makedirs(epoch_dir, exist_ok=True)
-            val_metrics = run_validation(
-                ema=ema,
-                diffusion=eval_diffusion,
-                vae=vae,
-                val_loader=val_loader,
-                num_val_samples=args.num_val_samples,
-                latent_size=latent_size,
-                device=device,
-                num_classes=args.num_classes,
-                logger=logger,
-                sample_dir=epoch_dir,
-                tag="val",
-                cfg_scale=args.eval_cfg_scale,
-                head=args.eval_head,
-                blend_weight=args.eval_blend_weight,
-                num_grid_samples=args.num_grid_samples,
-            )
-            if val_metrics and csv_writer is not None:
-                csv_writer.writerow({
-                    "step": train_steps,
-                    "epoch": epoch,
-                    "split": "val",
-                    "loss_total": "",
-                    "loss_eps": "",
-                    "loss_x0": "",
-                    "loss_vb": "",
-                    "steps_per_sec": "",
-                    "fid": val_metrics.get("fid", ""),
-                    "kid_mean": val_metrics.get("kid_mean", ""),
-                    "kid_std": val_metrics.get("kid_std", ""),
-                    "inception_score": val_metrics.get("inception_score", ""),
-                    "inception_score_std": val_metrics.get("inception_score_std", ""),
-                })
-                csv_file.flush()
-            train_metrics = run_validation(
-                ema=ema,
-                diffusion=eval_diffusion,
-                vae=vae,
-                val_loader=train_metrics_loader,
-                num_val_samples=args.num_val_samples,
-                latent_size=latent_size,
-                device=device,
-                num_classes=args.num_classes,
-                logger=logger,
-                sample_dir=epoch_dir,
-                tag="train",
-                cfg_scale=args.eval_cfg_scale,
-                head=args.eval_head,
-                blend_weight=args.eval_blend_weight,
-                num_grid_samples=args.num_grid_samples,
-            )
-            if train_metrics and csv_writer is not None:
-                csv_writer.writerow({
-                    "step": train_steps,
-                    "epoch": epoch,
-                    "split": "train",
-                    "loss_total": "",
-                    "loss_eps": "",
-                    "loss_x0": "",
-                    "loss_vb": "",
-                    "steps_per_sec": "",
-                    "fid": train_metrics.get("fid", ""),
-                    "kid_mean": train_metrics.get("kid_mean", ""),
-                    "kid_std": train_metrics.get("kid_std", ""),
-                    "inception_score": train_metrics.get("inception_score", ""),
-                    "inception_score_std": train_metrics.get("inception_score_std", ""),
-                })
-                csv_file.flush()
+            eval_heads = ["head1", "head2", "blend"]
+            for eval_head in eval_heads:
+                head_dir = os.path.join(epoch_dir, eval_head)
+                os.makedirs(head_dir, exist_ok=True)
+                val_metrics = run_validation(
+                    ema=ema,
+                    diffusion=eval_diffusion,
+                    vae=vae,
+                    val_loader=val_loader,
+                    num_val_samples=args.num_val_samples,
+                    latent_size=latent_size,
+                    device=device,
+                    num_classes=args.num_classes,
+                    logger=logger,
+                    sample_dir=head_dir,
+                    tag=f"val_{eval_head}",
+                    cfg_scale=args.eval_cfg_scale,
+                    head=eval_head,
+                    blend_weight=args.eval_blend_weight,
+                    num_grid_samples=args.num_grid_samples,
+                )
+                if val_metrics and csv_writer is not None:
+                    csv_writer.writerow({
+                        "step": train_steps,
+                        "epoch": epoch,
+                        "split": f"val_{eval_head}",
+                        "loss_total": "",
+                        "loss_eps": "",
+                        "loss_x0": "",
+                        "loss_vb": "",
+                        "steps_per_sec": "",
+                        "fid": val_metrics.get("fid", ""),
+                        "kid_mean": val_metrics.get("kid_mean", ""),
+                        "kid_std": val_metrics.get("kid_std", ""),
+                        "inception_score": val_metrics.get("inception_score", ""),
+                        "inception_score_std": val_metrics.get("inception_score_std", ""),
+                    })
+                    csv_file.flush()
+                train_metrics = run_validation(
+                    ema=ema,
+                    diffusion=eval_diffusion,
+                    vae=vae,
+                    val_loader=train_metrics_loader,
+                    num_val_samples=args.num_val_samples,
+                    latent_size=latent_size,
+                    device=device,
+                    num_classes=args.num_classes,
+                    logger=logger,
+                    sample_dir=head_dir,
+                    tag=f"train_{eval_head}",
+                    cfg_scale=args.eval_cfg_scale,
+                    head=eval_head,
+                    blend_weight=args.eval_blend_weight,
+                    num_grid_samples=args.num_grid_samples,
+                )
+                if train_metrics and csv_writer is not None:
+                    csv_writer.writerow({
+                        "step": train_steps,
+                        "epoch": epoch,
+                        "split": f"train_{eval_head}",
+                        "loss_total": "",
+                        "loss_eps": "",
+                        "loss_x0": "",
+                        "loss_vb": "",
+                        "steps_per_sec": "",
+                        "fid": train_metrics.get("fid", ""),
+                        "kid_mean": train_metrics.get("kid_mean", ""),
+                        "kid_std": train_metrics.get("kid_std", ""),
+                        "inception_score": train_metrics.get("inception_score", ""),
+                        "inception_score_std": train_metrics.get("inception_score_std", ""),
+                    })
+                    csv_file.flush()
         dist.barrier()
 
     logger.info("Done!")

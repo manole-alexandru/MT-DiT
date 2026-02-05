@@ -299,7 +299,7 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
+    model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     eval_diffusion = create_diffusion(str(args.eval_num_steps)) if args.eval_num_steps else diffusion
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -388,7 +388,7 @@ def main(args):
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            # Standard diffusion objective (eps + optional vb term); no multi-task weighting.
+            # Match upstream single-task behavior: use the base loss only.
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             eps_loss = loss_dict.get("mse_eps", torch.tensor(0.0, device=device)).mean()
@@ -436,7 +436,7 @@ def main(args):
                     })
                     csv_file.flush()
                 if rank == 0:
-                    progress.set_postfix(loss=f"{avg_loss:.4f}", eps=f"{avg_eps:.4f}", vb=f"{avg_vb:.4f}")
+                progress.set_postfix(loss=f"{avg_loss:.4f}", eps=f"{avg_eps:.4f}", vb=f"{avg_vb:.4f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 running_eps_loss = 0
