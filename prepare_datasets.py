@@ -8,6 +8,7 @@
 # ImageNet (requires manual tar download), Tiny-ImageNet (auto-downloadable fallback).
 
 import argparse
+import csv
 import os
 from collections import defaultdict
 from typing import Iterable, List, Optional
@@ -104,8 +105,13 @@ def prepare_celeba(args, out_root: str):
             if "list_eval_partition.txt" in filenames:
                 partition_path = os.path.join(dirpath, "list_eval_partition.txt")
                 break
+            if "list_eval_partition.csv" in filenames:
+                partition_path = os.path.join(dirpath, "list_eval_partition.csv")
+                break
         if partition_path is None:
-            raise FileNotFoundError("Could not find list_eval_partition.txt in the Kaggle CelebA download.")
+            raise FileNotFoundError(
+                "Could not find list_eval_partition.txt or list_eval_partition.csv in the Kaggle CelebA download."
+            )
 
         candidates = []
         part_dir = os.path.dirname(partition_path)
@@ -134,21 +140,41 @@ def prepare_celeba(args, out_root: str):
     partition_path, image_dir = find_celeba_assets(dataset_root)
 
     splits = {"train": [], "val": [], "test": []}
-    with open(partition_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            fname, split_id = parts[0], parts[1]
-            if split_id == "0":
-                splits["train"].append(fname)
-            elif split_id == "1":
-                splits["val"].append(fname)
-            elif split_id == "2":
-                splits["test"].append(fname)
+    if partition_path.endswith(".csv"):
+        with open(partition_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                fname, split_id = row[0].strip(), row[1].strip()
+                if split_id == "0":
+                    splits["train"].append(fname)
+                elif split_id == "1":
+                    splits["val"].append(fname)
+                elif split_id == "2":
+                    splits["test"].append(fname)
+    else:
+        with open(partition_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                fname, split_id = parts[0], parts[1]
+                if split_id == "0":
+                    splits["train"].append(fname)
+                elif split_id == "1":
+                    splits["val"].append(fname)
+                elif split_id == "2":
+                    splits["test"].append(fname)
+
+    if not splits["train"] and not splits["val"] and not splits["test"]:
+        raise RuntimeError(
+            f"Found partition file at {partition_path}, but could not parse any entries."
+        )
 
     class_names = ["celeba"]
 

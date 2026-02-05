@@ -436,7 +436,7 @@ def main(args):
                     })
                     csv_file.flush()
                 if rank == 0:
-                progress.set_postfix(loss=f"{avg_loss:.4f}", eps=f"{avg_eps:.4f}", vb=f"{avg_vb:.4f}")
+                    progress.set_postfix(loss=f"{avg_loss:.4f}", eps=f"{avg_eps:.4f}", vb=f"{avg_vb:.4f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 running_eps_loss = 0
