@@ -87,14 +87,92 @@ def prepare_svhn(args, out_root: str):
 
 
 def prepare_celeba(args, out_root: str):
-    base_tf = transforms.Compose([])
-    train_ds = datasets.CelebA(args.download_root, split="train", download=True, transform=base_tf)
-    val_ds = datasets.CelebA(args.download_root, split="valid", download=True, transform=base_tf)
-    test_ds = datasets.CelebA(args.download_root, split="test", download=True, transform=base_tf)
+    try:
+        import kagglehub
+    except Exception as exc:
+        raise RuntimeError(
+            "kagglehub is required to download CelebA. "
+            "Install it (e.g., `pip install kagglehub`) and ensure Kaggle credentials are set."
+        ) from exc
+
+    # Download CelebA from Kaggle via kagglehub.
+    dataset_root = kagglehub.dataset_download("jessicali9530/celeba-dataset")
+
+    def find_celeba_assets(root: str):
+        partition_path = None
+        for dirpath, _, filenames in os.walk(root):
+            if "list_eval_partition.txt" in filenames:
+                partition_path = os.path.join(dirpath, "list_eval_partition.txt")
+                break
+        if partition_path is None:
+            raise FileNotFoundError("Could not find list_eval_partition.txt in the Kaggle CelebA download.")
+
+        candidates = []
+        part_dir = os.path.dirname(partition_path)
+        candidates.append(os.path.join(root, "img_align_celeba", "img_align_celeba"))
+        candidates.append(os.path.join(root, "img_align_celeba"))
+        candidates.append(os.path.join(part_dir, "img_align_celeba", "img_align_celeba"))
+        candidates.append(os.path.join(part_dir, "img_align_celeba"))
+
+        for c in candidates:
+            if os.path.isdir(c):
+                try:
+                    sample = next((f for f in os.listdir(c) if f.lower().endswith(".jpg")), None)
+                except OSError:
+                    sample = None
+                if sample:
+                    return partition_path, c
+
+        # Fallback: search for a directory containing common CelebA filename.
+        target = "000001.jpg"
+        for dirpath, _, filenames in os.walk(root):
+            if target in filenames:
+                return partition_path, dirpath
+
+        raise FileNotFoundError("Could not locate img_align_celeba image directory in the Kaggle CelebA download.")
+
+    partition_path, image_dir = find_celeba_assets(dataset_root)
+
+    splits = {"train": [], "val": [], "test": []}
+    with open(partition_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            fname, split_id = parts[0], parts[1]
+            if split_id == "0":
+                splits["train"].append(fname)
+            elif split_id == "1":
+                splits["val"].append(fname)
+            elif split_id == "2":
+                splits["test"].append(fname)
+
     class_names = ["celeba"]
-    _save_split(SingleClassWrapper(train_ds, 0), os.path.join(out_root, "train"), class_names, args.resize)
-    _save_split(SingleClassWrapper(val_ds, 0), os.path.join(out_root, "val"), class_names, args.resize)
-    _save_split(SingleClassWrapper(test_ds, 0), os.path.join(out_root, "test"), class_names, args.resize)
+
+    class ImageListDataset(torch.utils.data.Dataset):
+        def __init__(self, root_dir: str, names: List[str], label: int = 0):
+            self.root_dir = root_dir
+            self.names = names
+            self.label = label
+
+        def __len__(self):
+            return len(self.names)
+
+        def __getitem__(self, idx):
+            img_path = os.path.join(self.root_dir, self.names[idx])
+            img = Image.open(img_path)
+            return img, self.label
+
+    train_ds = ImageListDataset(image_dir, splits["train"], 0)
+    val_ds = ImageListDataset(image_dir, splits["val"], 0)
+    test_ds = ImageListDataset(image_dir, splits["test"], 0)
+
+    _save_split(train_ds, os.path.join(out_root, "train"), class_names, args.resize)
+    _save_split(val_ds, os.path.join(out_root, "val"), class_names, args.resize)
+    _save_split(test_ds, os.path.join(out_root, "test"), class_names, args.resize)
 
 
 def prepare_imagenet(args, out_root: str):
