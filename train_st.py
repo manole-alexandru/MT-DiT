@@ -30,7 +30,7 @@ import os
 import csv
 from tqdm import tqdm
 
-from models import DiT_models
+from models_st import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
